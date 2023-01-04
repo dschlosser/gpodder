@@ -141,7 +141,8 @@ class Exporter(object):
         """
         outline = doc.createElement('outline')
         outline.setAttribute('title', channel.title)
-        outline.setAttribute('text', channel.description)
+        outline.setAttribute('text', channel.title)
+        outline.setAttribute('description', channel.description)
         outline.setAttribute('xmlUrl', channel.url)
         outline.setAttribute('type', self.FEED_TYPE)
         return outline
