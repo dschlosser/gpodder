@@ -93,6 +93,8 @@ class gPodder(BuilderWidget, dbus.service.Object):
         self.last_episode_date_refresh = None
         self.refresh_episode_dates()
 
+        self.on_episode_list_selection_changed_id = None
+
     def new(self):
         if self.application.want_headerbar:
             self.header_bar = Gtk.HeaderBar()
@@ -198,7 +200,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
         self.init_download_list_treeview()
 
         self.download_tasks_seen = set()
-        self.download_list_update_enabled = False
+        self.download_list_update_timer = None
         self.things_adding_tasks = 0
         self.download_task_monitors = set()
 
@@ -308,6 +310,11 @@ class gPodder(BuilderWidget, dbus.service.Object):
         g.add_action(action)
 
         action = Gio.SimpleAction.new_stateful(
+            'viewTrimEpisodeTitlePrefix', None, GLib.Variant.new_boolean(self.config.ui.gtk.episode_list.trim_title_prefix))
+        action.connect('activate', self.on_item_view_trim_episode_title_prefix_toggled)
+        g.add_action(action)
+
+        action = Gio.SimpleAction.new_stateful(
             'viewShowEpisodeDescription', None, GLib.Variant.new_boolean(self.config.ui.gtk.episode_list.descriptions))
         action.connect('activate', self.on_item_view_show_episode_description_toggled)
         g.add_action(action)
@@ -344,6 +351,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
             ('toggleEpisodeNew', self.on_item_toggle_played_activate),
             ('toggleEpisodeLock', self.on_item_toggle_lock_activate),
             ('openEpisodeDownloadFolder', self.on_open_episode_download_folder),
+            ('selectChannel', self.on_select_channel_of_episode),
             ('findEpisode', self.on_find_episode_activate),
             ('toggleShownotes', self.on_shownotes_selected_episodes),
             # Extras
@@ -371,6 +379,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
         self.toggle_episode_new_action = g.lookup_action('toggleEpisodeNew')
         self.toggle_episode_lock_action = g.lookup_action('toggleEpisodeLock')
         self.open_episode_download_folder_action = g.lookup_action('openEpisodeDownloadFolder')
+        self.select_channel_of_episode_action = g.lookup_action('selectChannel')
         # Extras
 
     def inject_extensions_menu(self):
@@ -429,9 +438,10 @@ class gPodder(BuilderWidget, dbus.service.Object):
         def progress_callback(title, progress):
             self.partial_downloads_indicator.on_message(title)
             self.partial_downloads_indicator.on_progress(progress)
-            if time.time() >= self.partial_downloads_indicator.next_update:
-                self.partial_downloads_indicator.update_gui()
-                self.force_ui_update()
+            self.partial_downloads_indicator.on_tick()  # not cancellable
+
+        def final_progress_callback():
+            self.partial_downloads_indicator.on_tick(final=_('Cleaning up...'))
 
         def finish_progress_callback(resumable_episodes):
             def offer_resuming():
@@ -452,6 +462,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
         common.find_partial_downloads(self.channels,
                 start_progress_callback,
                 progress_callback,
+                final_progress_callback,
                 finish_progress_callback)
 
     def episode_object_by_uri(self, uri):
@@ -1057,6 +1068,13 @@ class gPodder(BuilderWidget, dbus.service.Object):
             self._search_episodes.show_search(grab_focus=False)
 
     def on_episode_list_selection_changed(self, selection):
+        # Only update the UI every 250ms to prevent lag when rapidly changing selected episode or shift-selecting episodes
+        if self.on_episode_list_selection_changed_id is None:
+            self.on_episode_list_selection_changed_id = util.idle_timeout_add(250, self._on_episode_list_selection_changed)
+
+    def _on_episode_list_selection_changed(self):
+        self.on_episode_list_selection_changed_id = None
+
         # Update the toolbar buttons
         self.play_or_download()
         # and the shownotes
@@ -1148,10 +1166,17 @@ class gPodder(BuilderWidget, dbus.service.Object):
             self.things_adding_tasks += 1
         elif state == gPodderSyncUI.DL_ADDED_TASKS:
             self.things_adding_tasks -= 1
-        if not self.download_list_update_enabled:
+        if self.download_list_update_timer is None:
             self.update_downloads_list()
-            util.IdleTimeout(1500, self.update_downloads_list)
-            self.download_list_update_enabled = True
+            self.download_list_update_timer = util.IdleTimeout(1500, self.update_downloads_list).set_max_milliseconds(5000)
+
+    def stop_download_list_update_timer(self):
+        if self.download_list_update_timer is None:
+            return False
+
+        self.download_list_update_timer.cancel()
+        self.download_list_update_timer = None
+        return True
 
     def cleanup_downloads(self):
         model = self.download_status_model
@@ -1315,7 +1340,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
                     self.cleanup_downloads()
 
                 # Stop updating the download list here
-                self.download_list_update_enabled = False
+                self.stop_download_list_update_timer()
 
             self.gPodder.set_title(' - '.join(title))
 
@@ -1324,7 +1349,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
             if channel_urls:
                 self.update_podcast_list_model(channel_urls)
 
-            return self.download_list_update_enabled
+            return (self.download_list_update_timer is not None)
         except Exception as e:
             logger.error('Exception happened while updating download list.', exc_info=True)
             self.show_message(
@@ -1341,6 +1366,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
         if name == 'ui.gtk.toolbar':
             self.toolbar.set_property('visible', new_value)
         elif name in ('ui.gtk.episode_list.descriptions',
+                'ui.gtk.episode_list.trim_title_prefix',
                 'ui.gtk.episode_list.always_show_new'):
             self.update_episode_list_model()
         elif name in ('auto.update.enabled', 'auto.update.frequency'):
@@ -1624,40 +1650,25 @@ class gPodder(BuilderWidget, dbus.service.Object):
         else:
             self.download_queue_manager.queue_task(task)
 
-    def force_ui_update(self):
-        def callback():
-            Gtk.main_quit()
-        GLib.timeout_add(1, callback)
-        Gtk.main()
-
     def _for_each_task_set_status(self, tasks, status, force_start=False):
         count = len(tasks)
         if count:
             progress_indicator = ProgressIndicator(
                     _('Queueing') if status == download.DownloadTask.QUEUED else
                     _('Removing') if status is None else download.DownloadTask.STATUS_MESSAGE[status],
-                    '', True, self.get_dialog_parent())
-            progress_indicator.on_message('0 / %d' % count)
+                    '', True, self.get_dialog_parent(), count)
         else:
             progress_indicator = None
 
-        def progress_callback(title, progress):
-            progress_indicator.on_message(title)
-            progress_indicator.on_progress(progress)
-            if time.time() >= progress_indicator.next_update:
-                progress_indicator.update_gui()
-                self.force_ui_update()
-                if not progress_indicator.cancellable:
-                    return False
-            return True
-        self.__for_each_task_set_status(tasks, status, force_start=force_start, progress_callback=progress_callback)
+        restart_timer = self.stop_download_list_update_timer()
+        self.download_queue_manager.disable()
+        self.__for_each_task_set_status(tasks, status, force_start, progress_indicator, restart_timer)
+        self.download_queue_manager.enable()
 
         if progress_indicator:
             progress_indicator.on_finished()
 
-    def __for_each_task_set_status(self, tasks, status, force_start=False, progress_callback=None):
-        count = len(tasks)
-        n = 0
+    def __for_each_task_set_status(self, tasks, status, force_start=False, progress_indicator=None, restart_timer=False):
         episode_urls = set()
         model = self.treeDownloads.get_model()
         has_queued_tasks = False
@@ -1707,13 +1718,14 @@ class gPodder(BuilderWidget, dbus.service.Object):
                 else:
                     # We can (hopefully) simply set the task status here
                     task.status = status
-            if progress_callback:
-                n += 1
-                if not progress_callback('%d / %d' % (n, count), n / count):
+            if progress_indicator:
+                if not progress_indicator.on_tick():
                     break
+        if progress_indicator:
+            progress_indicator.on_tick(final=_('Updating...'))
 
         # Update the tab title and downloads list
-        if has_queued_tasks:
+        if has_queued_tasks or restart_timer:
             self.set_download_list_state(gPodderSyncUI.DL_ONEOFF)
         else:
             self.update_downloads_list()
@@ -1826,6 +1838,16 @@ class gPodder(BuilderWidget, dbus.service.Object):
         episodes = self.get_selected_episodes()
         assert len(episodes) == 1
         util.gui_open(episodes[0].parent.save_dir, gui=self)
+
+    def on_select_channel_of_episode(self, unused1=None, unused2=None):
+        episodes = self.get_selected_episodes()
+        assert len(episodes) == 1
+        channel = episodes[0].parent
+        # Focus channel list
+        self.treeChannels.grab_focus()
+        # Select channel in list
+        path = self.podcast_list_model.get_filter_path_from_url(channel.url)
+        self.treeChannels.set_cursor(path)
 
     def treeview_channels_show_context_menu(self, treeview, event=None):
         model, paths = self.treeview_handle_context_menu_click(treeview, event)
@@ -2155,6 +2177,10 @@ class gPodder(BuilderWidget, dbus.service.Object):
                 item.connect('activate', self.on_open_episode_download_folder)
                 menu.append(item)
 
+                item = Gtk.MenuItem(_('Select channel'))
+                item.connect('activate', self.on_select_channel_of_episode)
+                menu.append(item)
+
             menu.attach_to_widget(treeview)
             menu.show_all()
             # Disable tooltips while we are showing the menu, so
@@ -2206,6 +2232,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
         self.toggle_episode_new_action.set_enabled(is_episode_selected)
         self.toggle_episode_lock_action.set_enabled(can_lock)
         self.open_episode_download_folder_action.set_enabled(len(episodes) == 1)
+        self.select_channel_of_episode_action.set_enabled(len(episodes) == 1)
 
     def set_title(self, new_title):
         self.default_title = new_title
@@ -2435,7 +2462,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
         if remaining_seconds > 3600:
             # timeout an hour early in the event daylight savings changes the clock forward
             remaining_seconds = remaining_seconds - 3600
-        GLib.timeout_add(remaining_seconds * 1000, self.refresh_episode_dates)
+        util.idle_timeout_add(remaining_seconds * 1000, self.refresh_episode_dates)
 
     def update_podcast_list_model(self, urls=None, selected=False, select_url=None,
             sections_changed=False):
@@ -2836,6 +2863,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
         def update_feed_cache_proc():
             updated_channels = []
             nr_update_errors = 0
+            new_episodes = []
             for updated, channel in enumerate(channels):
                 if self.feed_cache_update_cancelled:
                     break
@@ -2849,7 +2877,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
                 try:
                     channel._update_error = None
                     util.idle_add(indicate_updating_podcast, channel)
-                    channel.update(max_episodes=self.config.limit.episodes)
+                    new_episodes.extend(channel.update(max_episodes=self.config.limit.episodes))
                     self._update_cover(channel)
                 except Exception as e:
                     message = str(e)
@@ -2858,7 +2886,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
                     else:
                         channel._update_error = '?'
                     nr_update_errors += 1
-                    logger.error('Error: %s', message, exc_info=(e.__class__ not in [
+                    logger.error('Error updating feed: %s: %s', channel.title, message, exc_info=(e.__class__ not in [
                         gpodder.feedcore.BadRequest,
                         gpodder.feedcore.AuthenticationRequired,
                         gpodder.feedcore.Unsubscribe,
@@ -2893,7 +2921,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
                        nr_update_errors) % {'count': nr_update_errors},
                     _('Error while updating feeds'), widget=self.treeChannels)
 
-            def update_feed_cache_finish_callback():
+            def update_feed_cache_finish_callback(new_episodes):
                 # Process received episode actions for all updated URLs
                 self.process_received_episode_actions()
 
@@ -2906,9 +2934,11 @@ class gPodder(BuilderWidget, dbus.service.Object):
                     # The user decided to abort the feed update
                     self.show_update_feeds_buttons()
 
-                # Only search for new episodes in podcasts that have been
-                # updated, not in other podcasts (for single-feed updates)
-                episodes = self.get_new_episodes([c for c in updated_channels])
+                # The filter extension can mark newly added episodes as old,
+                # so take only episodes marked as new.
+                episodes = ((e for e in new_episodes if e.check_is_new())
+                            if self.config.ui.gtk.only_added_are_new
+                            else self.get_new_episodes([c for c in updated_channels]))
 
                 if self.config.downloads.chronological_order:
                     # download older episodes first
@@ -2959,7 +2989,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
 
                     self.show_update_feeds_buttons()
 
-            util.idle_add(update_feed_cache_finish_callback)
+            util.idle_add(update_feed_cache_finish_callback, new_episodes)
 
     def on_gPodder_delete_event(self, *args):
         """Called when the GUI wants to close the window
@@ -3244,34 +3274,44 @@ class gPodder(BuilderWidget, dbus.service.Object):
         self.download_episode_list(episodes, True, hide_progress=hide_progress)
 
     def download_episode_list(self, episodes, add_paused=False, force_start=False, downloader=None, hide_progress=False):
-        def queue_tasks(tasks, queued_existing_task):
-            n = 0
-            count = len(tasks)
-            if count and not hide_progress:
-                progress_indicator = ProgressIndicator(
-                        _('Queueing'),
-                        '', True, self.get_dialog_parent())
-                progress_indicator.on_message('0 / %d' % count)
-            else:
-                progress_indicator = None
+        # Start progress indicator to queue existing tasks
+        count = len(episodes)
+        if count and not hide_progress:
+            progress_indicator = ProgressIndicator(
+                    _('Queueing'),
+                    '', True, self.get_dialog_parent(), count)
+        else:
+            progress_indicator = None
 
-            for task in tasks:
-                with task:
-                    if add_paused:
-                        task.status = task.PAUSED
-                    else:
-                        self.mygpo_client.on_download([task.episode])
-                        self.queue_task(task, force_start)
+        restart_timer = self.stop_download_list_update_timer()
+        self.download_queue_manager.disable()
+
+        def queue_tasks(tasks, queued_existing_task):
+            if progress_indicator is None or not progress_indicator.cancelled:
                 if progress_indicator:
-                    n += 1
-                    progress_indicator.on_message('%d / %d' % (n, count))
-                    progress_indicator.on_progress(n / count)
-                    if time.time() >= progress_indicator.next_update:
-                        progress_indicator.update_gui()
-                        self.force_ui_update()
-                        if not progress_indicator.cancellable:
+                    count = len(tasks)
+                    if count:
+                        # Restart progress indicator to queue new tasks
+                        progress_indicator.set_max_ticks(count)
+                        progress_indicator.on_progress(0.0)
+
+                for task in tasks:
+                    with task:
+                        if add_paused:
+                            task.status = task.PAUSED
+                        else:
+                            self.mygpo_client.on_download([task.episode])
+                            self.queue_task(task, force_start)
+                    if progress_indicator:
+                        if not progress_indicator.on_tick():
                             break
-            if tasks or queued_existing_task:
+
+            if progress_indicator:
+                progress_indicator.on_tick(final=_('Updating...'))
+            self.download_queue_manager.enable()
+
+            # Update the tab title and downloads list
+            if tasks or queued_existing_task or restart_timer:
                 self.set_download_list_state(gPodderSyncUI.DL_ONEOFF)
             # Flush updated episode status
             if self.mygpo_client.can_access_webservice():
@@ -3288,6 +3328,11 @@ class gPodder(BuilderWidget, dbus.service.Object):
             episodes = list(Model.sort_episodes_by_pubdate(episodes))
 
         for episode in episodes:
+            if progress_indicator:
+                # The continues require ticking before doing the work
+                if not progress_indicator.on_tick():
+                    break
+
             logger.debug('Downloading episode: %s', episode.title)
             if not episode.was_downloaded(and_exists=True):
                 episode._download_error = None
@@ -3332,14 +3377,30 @@ class gPodder(BuilderWidget, dbus.service.Object):
         if not tasks:
             return
 
+        progress_indicator = ProgressIndicator(
+                download.DownloadTask.STATUS_MESSAGE[download.DownloadTask.CANCELLING],
+                '', True, self.get_dialog_parent(), len(tasks))
+
+        restart_timer = self.stop_download_list_update_timer()
+        self.download_queue_manager.disable()
         for task in tasks:
             task.cancel()
+
+            if not progress_indicator.on_tick():
+                break
+        progress_indicator.on_tick(final=_('Updating...'))
+        self.download_queue_manager.enable()
 
         self.update_episode_list_icons([task.url for task in tasks])
         self.play_or_download()
 
         # Update the tab title and downloads list
-        self.update_downloads_list()
+        if restart_timer:
+            self.set_download_list_state(gPodderSyncUI.DL_ONEOFF)
+        else:
+            self.update_downloads_list()
+
+        progress_indicator.on_finished()
 
     def new_episodes_show(self, episodes, notification=False, selected=None):
         columns = (
@@ -3434,6 +3495,11 @@ class gPodder(BuilderWidget, dbus.service.Object):
     def on_item_view_always_show_new_episodes_toggled(self, action, param):
         state = action.get_state()
         self.config.ui.gtk.episode_list.always_show_new = not state
+        action.set_state(GLib.Variant.new_boolean(not state))
+
+    def on_item_view_trim_episode_title_prefix_toggled(self, action, param):
+        state = action.get_state()
+        self.config.ui.gtk.episode_list.trim_title_prefix = not state
         action.set_state(GLib.Variant.new_boolean(not state))
 
     def on_item_view_show_episode_description_toggled(self, action, param):
@@ -3788,7 +3854,6 @@ class gPodder(BuilderWidget, dbus.service.Object):
         if self.wNotebook.get_current_page() == 0:
             episodes = [e for e in self.get_selected_episodes() if e.can_download()]
             self.download_episode_list(episodes)
-            self.update_downloads_list()
         else:
             selection = self.treeDownloads.get_selection()
             (model, paths) = selection.get_selected_rows()
@@ -3799,10 +3864,9 @@ class gPodder(BuilderWidget, dbus.service.Object):
 
     def on_pause_selected_episodes(self, action_or_widget, param=None):
         if self.wNotebook.get_current_page() == 0:
-            for episode in self.get_selected_episodes():
-                if episode.can_pause():
-                    episode.download_task.pause()
-            self.update_downloads_list()
+            selection = self.get_selected_episodes()
+            selected_tasks = [(None, e.download_task) for e in selection if e.download_task is not None and e.can_pause()]
+            self._for_each_task_set_status(selected_tasks, download.DownloadTask.PAUSING)
         else:
             selection = self.treeDownloads.get_selection()
             (model, paths) = selection.get_selected_rows()
@@ -3826,8 +3890,7 @@ class gPodder(BuilderWidget, dbus.service.Object):
             interval = 60 * 1000 * self.config.auto.update.frequency
             logger.debug('Setting up auto update timer with interval %d.',
                     self.config.auto.update.frequency)
-            self._auto_update_timer_source_id = GLib.timeout_add(
-                    interval, self._on_auto_update_timer)
+            self._auto_update_timer_source_id = util.idle_timeout_add(interval, self._on_auto_update_timer)
 
     def _on_auto_update_timer(self):
         if self.config.check_connection and not util.connection_available():

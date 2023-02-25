@@ -13,11 +13,11 @@ import time
 try:
     import yt_dlp as youtube_dl
     program_name = 'yt-dlp'
-    want_ytdl_version = '2021.02.04'
+    want_ytdl_version = '2023.02.17'
 except:
     import youtube_dl
     program_name = 'youtube-dl'
-    want_ytdl_version = '2021.02.04'
+    want_ytdl_version = '2023.02.17'  # youtube-dl has been patched, but not yet released
 
 import gpodder
 from gpodder import download, feedcore, model, registry, util, youtube
@@ -583,7 +583,7 @@ class gPodderExtension:
 
         box.pack_start(Gtk.HSeparator(), False, False, 0)
 
-        checkbox = Gtk.CheckButton(_('Embed all available subtitles to downloaded video'))
+        checkbox = Gtk.CheckButton(_('Embed all available subtitles in downloaded video'))
         checkbox.set_active(self.container.config.embed_subtitles)
         checkbox.connect('toggled', self.toggle_embed_subtitles)
         box.pack_start(checkbox, False, False, 0)
