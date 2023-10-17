@@ -7,7 +7,7 @@ mutagen==1.46.0
 mygpoclient==1.9
 podcastparser==0.6.9
 requests[socks]==2.28.1
-urllib3==1.26.13
+urllib3==1.26.18
 yt-dlp
 # eyed3 is optional and pulls in a lot of dependencies, so disable by default
 # eyed3
